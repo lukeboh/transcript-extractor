@@ -2,12 +2,50 @@
 import argparse
 import glob
 import shutil
+import multiprocessing as mp
+import csv
+import signal
+import statistics
+import time
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, List
 
 import whisper
 from whisper.tokenizer import LANGUAGES
+
+MODEL = None
+LANGUAGE = None
+
+
+def _init_worker(model_name: str, language: str) -> None:
+    global MODEL, LANGUAGE
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    warnings.filterwarnings(
+        "ignore",
+        message="FP16 is not supported on CPU; using FP32 instead",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="resource_tracker: There appear to be .* leaked semaphore objects",
+    )
+    LANGUAGE = language
+    MODEL = whisper.load_model(model_name)
+
+
+def _transcribe_one(audio_path_str: str, overwrite: bool) -> tuple[str, str, float]:
+    audio_path = Path(audio_path_str)
+    output_path = audio_path.with_suffix(".txt")
+    if output_path.exists() and not overwrite:
+        return ("skipped", str(output_path))
+    start = time.perf_counter()
+    result = MODEL.transcribe(str(audio_path), language=LANGUAGE)
+    temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    temp_path.write_text(result.get("text", "").strip() + "\n", encoding="utf-8")
+    temp_path.replace(output_path)
+    elapsed = time.perf_counter() - start
+    return ("ok", str(output_path), elapsed)
 
 
 def expand_inputs(patterns: Iterable[str]) -> List[Path]:
@@ -31,7 +69,12 @@ def expand_inputs(patterns: Iterable[str]) -> List[Path]:
 
 
 def transcribe_files(
-    files: List[Path], model_name: str, language: str, overwrite: bool
+    files: List[Path],
+    model_name: str,
+    language: str,
+    overwrite: bool,
+    workers: int,
+    metrics_path: Path | None,
 ) -> None:
     if not files:
         raise SystemExit("Nenhum arquivo encontrado para o padrão informado.")
@@ -57,29 +100,94 @@ def transcribe_files(
             f"Idiomas suportados: {supported}"
         )
 
-    model = whisper.load_model(model_name)
-
     target_files = [path for path in files if not path.is_dir()]
     total = len(target_files)
     processed = 0
     skipped = 0
+    durations: List[float] = []
+    start_total = time.perf_counter()
 
-    try:
+    if overwrite:
+        to_process = target_files
+    else:
+        to_process = []
         for audio_path in target_files:
             output_path = audio_path.with_suffix(".txt")
-            if output_path.exists() and not overwrite:
+            if output_path.exists():
                 skipped += 1
                 print(f"PULADO (já existe): {output_path}")
-                continue
-            result = model.transcribe(str(audio_path), language=normalized_language)
-            temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
-            temp_path.write_text(
-                result.get("text", "").strip() + "\n", encoding="utf-8"
-            )
-            temp_path.replace(output_path)
-            processed += 1
-            print(f"OK: {audio_path} -> {output_path}")
+            else:
+                to_process.append(audio_path)
+
+    if workers <= 1:
+        model = whisper.load_model(model_name)
+        try:
+            for audio_path in to_process:
+                output_path = audio_path.with_suffix(".txt")
+                start = time.perf_counter()
+                result = model.transcribe(
+                    str(audio_path), language=normalized_language
+                )
+                temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+                temp_path.write_text(
+                    result.get("text", "").strip() + "\n", encoding="utf-8"
+                )
+                temp_path.replace(output_path)
+                duration = time.perf_counter() - start
+                durations.append(duration)
+                _append_metrics(
+                    metrics_path, audio_path, output_path, duration, workers
+                )
+                processed += 1
+                print(f"OK: {audio_path} -> {output_path}")
+        except KeyboardInterrupt:
+            remaining = total - processed - skipped
+            print("\nInterrompido pelo usuário (Ctrl+C).")
+            print(f"Total de arquivos: {total}")
+            print(f"Processados: {processed}")
+            print(f"Pulados (já existiam): {skipped}")
+            print(f"Restantes: {remaining}")
+            return
+        _print_performance_summary(start_total, total, processed, skipped, durations)
+        return
+
+    ctx = mp.get_context("spawn")
+    executor = ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_init_worker,
+        initargs=(model_name, normalized_language),
+        mp_context=ctx,
+    )
+    try:
+        future_map = {
+            executor.submit(_transcribe_one, str(path), overwrite): path
+            for path in to_process
+        }
+        for future in as_completed(future_map):
+            result = future.result()
+            status = result[0]
+            output_path = result[1]
+            if status == "skipped":
+                skipped += 1
+                print(f"PULADO (já existe): {output_path}")
+            else:
+                duration = result[2]
+                durations.append(duration)
+                _append_metrics(
+                    metrics_path,
+                    Path(future_map[future]),
+                    Path(output_path),
+                    duration,
+                    workers,
+                )
+                processed += 1
+                print(f"OK: {output_path}")
     except KeyboardInterrupt:
+        executor.shutdown(wait=False, cancel_futures=True)
+        for child in mp.active_children():
+            child.terminate()
+        for child in mp.active_children():
+            child.join(timeout=1)
         remaining = total - processed - skipped
         print("\nInterrompido pelo usuário (Ctrl+C).")
         print(f"Total de arquivos: {total}")
@@ -87,6 +195,49 @@ def transcribe_files(
         print(f"Pulados (já existiam): {skipped}")
         print(f"Restantes: {remaining}")
         return
+    finally:
+        executor.shutdown(wait=True, cancel_futures=False)
+    _print_performance_summary(start_total, total, processed, skipped, durations)
+
+
+def _print_performance_summary(
+    start_total: float,
+    total: int,
+    processed: int,
+    skipped: int,
+    durations: List[float],
+) -> None:
+    elapsed_total = time.perf_counter() - start_total
+    print("\nResumo de desempenho")
+    print(f"Total de arquivos: {total}")
+    print(f"Processados: {processed}")
+    print(f"Pulados (já existiam): {skipped}")
+    print(f"Tempo total: {elapsed_total:.2f}s")
+    if durations:
+        print(f"Tempo médio por arquivo: {statistics.mean(durations):.2f}s")
+        print(f"Mediana por arquivo: {statistics.median(durations):.2f}s")
+        print(f"Mínimo por arquivo: {min(durations):.2f}s")
+        print(f"Máximo por arquivo: {max(durations):.2f}s")
+
+
+def _append_metrics(
+    metrics_path: Path | None,
+    input_path: Path,
+    output_path: Path,
+    duration: float,
+    workers: int,
+) -> None:
+    if metrics_path is None:
+        return
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not metrics_path.exists()
+    with metrics_path.open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        if write_header:
+            writer.writerow(["input", "output", "duration_sec", "workers"]) 
+        writer.writerow(
+            [str(input_path), str(output_path), f"{duration:.6f}", str(workers)]
+        )
 
 
 def main() -> None:
@@ -113,10 +264,29 @@ def main() -> None:
         action="store_true",
         help="Sobrescreve arquivos .txt existentes.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Quantidade de processos paralelos (>=1).",
+    )
+    parser.add_argument(
+        "--metrics-csv",
+        type=Path,
+        default=None,
+        help="Caminho para salvar métricas em CSV (opcional).",
+    )
     args = parser.parse_args()
 
     files = expand_inputs(args.inputs)
-    transcribe_files(files, args.model, args.language, args.overwrite)
+    transcribe_files(
+        files,
+        args.model,
+        args.language,
+        args.overwrite,
+        args.workers,
+        args.metrics_csv,
+    )
 
 
 if __name__ == "__main__":
