@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import argparse
 import glob
+import os
 import shutil
 import multiprocessing as mp
 import csv
+import datetime as dt
 import signal
 import statistics
 import time
@@ -34,16 +36,19 @@ def _init_worker(model_name: str, language: str) -> None:
     MODEL = whisper.load_model(model_name)
 
 
-def _transcribe_one(audio_path_str: str, overwrite: bool) -> tuple[str, str, float]:
+def _transcribe_one(
+    audio_path_str: str, overwrite: bool
+) -> tuple[str, str, float]:
     audio_path = Path(audio_path_str)
     output_path = audio_path.with_suffix(".txt")
     if output_path.exists() and not overwrite:
-        return ("skipped", str(output_path))
+        return ("skipped", str(output_path), 0.0)
     start = time.perf_counter()
     result = MODEL.transcribe(str(audio_path), language=LANGUAGE)
     temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
-    temp_path.write_text(result.get("text", "").strip() + "\n", encoding="utf-8")
+    temp_path.write_text(_format_transcript(result, audio_path), encoding="utf-8")
     temp_path.replace(output_path)
+    _copy_file_times(audio_path, output_path)
     elapsed = time.perf_counter() - start
     return ("ok", str(output_path), elapsed)
 
@@ -130,13 +135,18 @@ def transcribe_files(
                 )
                 temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
                 temp_path.write_text(
-                    result.get("text", "").strip() + "\n", encoding="utf-8"
+                    _format_transcript(result, audio_path), encoding="utf-8"
                 )
                 temp_path.replace(output_path)
+                _copy_file_times(audio_path, output_path)
                 duration = time.perf_counter() - start
                 durations.append(duration)
                 _append_metrics(
-                    metrics_path, audio_path, output_path, duration, workers
+                    metrics_path,
+                    audio_path,
+                    output_path,
+                    duration,
+                    workers,
                 )
                 processed += 1
                 print(f"OK: {audio_path} -> {output_path}")
@@ -220,6 +230,34 @@ def _print_performance_summary(
         print(f"Máximo por arquivo: {max(durations):.2f}s")
 
 
+def _format_transcript(result: dict, audio_path: Path) -> str:
+    segments = result.get("segments") or []
+    if not segments:
+        return result.get("text", "").strip() + "\n"
+    base_time = dt.datetime.fromtimestamp(audio_path.stat().st_mtime)
+    lines = []
+    for segment in segments:
+        start = float(segment.get("start", 0.0))
+        text = (segment.get("text") or "").strip()
+        timestamp = _format_timestamp_with_date(base_time, start)
+        lines.append(f"{timestamp}\t{text}")
+    return "\n".join(lines).strip() + "\n"
+
+
+def _format_timestamp_with_date(base_time: dt.datetime, seconds: float) -> str:
+    delta = dt.timedelta(seconds=seconds)
+    ts = base_time + delta
+    return ts.strftime("%d/%m/%Y %H:%M:%S.%f")[:-3]
+
+
+def _copy_file_times(source: Path, target: Path) -> None:
+    try:
+        shutil.copystat(source, target)
+    except OSError:
+        stats = source.stat()
+        os.utime(target, (stats.st_atime, stats.st_mtime))
+
+
 def _append_metrics(
     metrics_path: Path | None,
     input_path: Path,
@@ -234,9 +272,14 @@ def _append_metrics(
     with metrics_path.open("a", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         if write_header:
-            writer.writerow(["input", "output", "duration_sec", "workers"]) 
+            writer.writerow(["input", "output", "duration_sec", "workers"])
         writer.writerow(
-            [str(input_path), str(output_path), f"{duration:.6f}", str(workers)]
+            [
+                str(input_path),
+                str(output_path),
+                f"{duration:.6f}",
+                str(workers),
+            ]
         )
 
 
