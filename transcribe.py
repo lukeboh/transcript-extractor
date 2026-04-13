@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import argparse
-import glob
-import os
-import shutil
-import multiprocessing as mp
 import csv
 import datetime as dt
+import glob
+import multiprocessing as mp
+import os
+import shutil
 import signal
 import statistics
 import time
@@ -36,9 +36,7 @@ def _init_worker(model_name: str, language: str) -> None:
     MODEL = whisper.load_model(model_name)
 
 
-def _transcribe_one(
-    audio_path_str: str, overwrite: bool
-) -> tuple[str, str, float]:
+def _transcribe_one(audio_path_str: str, overwrite: bool) -> tuple[str, str, float]:
     audio_path = Path(audio_path_str)
     output_path = audio_path.with_suffix(".txt")
     if output_path.exists() and not overwrite:
@@ -142,11 +140,7 @@ def transcribe_files(
                 duration = time.perf_counter() - start
                 durations.append(duration)
                 _append_metrics(
-                    metrics_path,
-                    audio_path,
-                    output_path,
-                    duration,
-                    workers,
+                    metrics_path, audio_path, output_path, duration, workers
                 )
                 processed += 1
                 print(f"OK: {audio_path} -> {output_path}")
@@ -274,23 +268,18 @@ def _append_metrics(
         if write_header:
             writer.writerow(["input", "output", "duration_sec", "workers"])
         writer.writerow(
-            [
-                str(input_path),
-                str(output_path),
-                f"{duration:.6f}",
-                str(workers),
-            ]
+            [str(input_path), str(output_path), f"{duration:.6f}", str(workers)]
         )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Transcreve arquivos .opus para .txt usando openai-whisper."
+        description="Transcreve arquivos de áudio (.opus, .mp3, etc.) para .txt usando openai-whisper."
     )
     parser.add_argument(
         "inputs",
         nargs="+",
-        help="Arquivo(s) ou padrão(ões) glob, ex: ./opus/*.opus",
+        help="Arquivo(s) ou padrão(ões) glob, ex: ./opus/*.opus ou ./mp3/*.mp3",
     )
     parser.add_argument(
         "--model",
